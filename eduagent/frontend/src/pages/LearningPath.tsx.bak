@@ -1,0 +1,158 @@
+import React, { useState } from 'react'
+import { Card, Typography, Tag, Space, Input, Spin, message, Row, Col, Alert } from 'antd'
+import { SearchOutlined, LinkOutlined, PlayCircleOutlined, FileTextOutlined, BookOutlined, ThunderboltOutlined, GlobalOutlined } from '@ant-design/icons'
+
+const { Title, Text, Paragraph } = Typography
+
+const platformIcons: Record<string, React.ReactNode> = {
+  'B站': <PlayCircleOutlined style={{ color: '#fb7299' }} />,
+  'bilibili': <PlayCircleOutlined style={{ color: '#fb7299' }} />,
+  'YouTube': <PlayCircleOutlined style={{ color: '#ff0000' }} />,
+  'Coursera': <GlobalOutlined style={{ color: '#0056d2' }} />,
+  '网易云课堂': <GlobalOutlined style={{ color: '#c9392a' }} />,
+  '慕课网': <GlobalOutlined style={{ color: '#1aad19' }} />,
+  'CSDN': <FileTextOutlined style={{ color: '#fc5531' }} />,
+  '知乎': <FileTextOutlined style={{ color: '#0066ff' }} />,
+}
+
+const platformColors: Record<string, string> = {
+  'B站': '#fb7299', 'bilibili': '#fb7299', 'YouTube': '#ff0000',
+  'Coursera': '#0056d2', '网易云课堂': '#c9392a', '慕课网': '#1aad19',
+  'CSDN': '#fc5531', '知乎': '#0066ff',
+}
+
+const typeIcons: Record<string, React.ReactNode> = {
+  '视频教程': <PlayCircleOutlined />,
+  '文章': <FileTextOutlined />,
+  '课程': <BookOutlined />,
+  '书籍': <BookOutlined />,
+}
+
+const LearningPathPage: React.FC = () => {
+  const [query, setQuery] = useState('')
+  const [resources, setResources] = useState<any[]>([])
+  const [loading, setLoading] = useState(false)
+  const [searched, setSearched] = useState(false)
+
+  const searchResources = async (val?: string) => {
+    const q = val || query
+    if (!q.trim()) { message.warning('请输入要搜索的课程名称'); return }
+    setLoading(true)
+    setSearched(true)
+    try {
+      const res = await fetch('/api/path/search', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: q.trim() }),
+      })
+      if (!res.ok) throw new Error()
+      const data = await res.json()
+      setResources(data.resources || [])
+    } catch {
+      message.error('搜索失败，请重试')
+    }
+    setLoading(false)
+  }
+
+  const popularCourses = ['人工智能导论', '机器学习', 'Python入门', '深度学习', '数据结构', '计算机网络', '操作系统', '线性代数']
+
+  return (
+    <div style={{ padding: 24, maxWidth: 1200, margin: '0 auto' }}>
+      <div style={{ marginBottom: 24, textAlign: 'center' }}>
+        <Title level={3}>
+          <SearchOutlined style={{ marginRight: 8, color: '#4F46E5' }} />
+          学习资源搜索
+        </Title>
+        <Text type="secondary">输入课程名称，AI 为你找到最好的在线学习资源</Text>
+      </div>
+
+      {/* 搜索框 */}
+      <div style={{ marginBottom: 24, maxWidth: 700, margin: '0 auto 24px' }}>
+        <Input.Search
+          size="large"
+          placeholder="输入你想学的课程，如：人工智能、Python、深度学习..."
+          enterButton={<><ThunderboltOutlined /> AI 搜索</>}
+          value={query}
+          onChange={e => setQuery(e.target.value)}
+          onSearch={searchResources}
+          loading={loading}
+        />
+      </div>
+
+      {/* 热门搜索 */}
+      {!searched && (
+        <div style={{ marginBottom: 24, maxWidth: 700, margin: '0 auto 24px' }}>
+          <Text type="secondary" style={{ marginBottom: 8, display: 'block' }}>🔥 热门搜索：</Text>
+          <Space wrap>
+            {popularCourses.map(c => (
+              <Tag key={c} style={{ cursor: 'pointer', padding: '4px 12px', fontSize: 13 }}
+                onClick={() => { setQuery(c); searchResources(c) }}>
+                {c}
+              </Tag>
+            ))}
+          </Space>
+        </div>
+      )}
+
+      {/* 搜索结果 */}
+      {loading && (
+        <div style={{ textAlign: 'center', padding: 60 }}>
+          <Spin size="large" />
+          <Paragraph type="secondary" style={{ marginTop: 12 }}>AI 正在搜索最佳学习资源...</Paragraph>
+        </div>
+      )}
+
+      {!loading && searched && resources.length === 0 && (
+        <Alert type="info" message="未找到资源" description="请尝试其他关键词" showIcon />
+      )}
+
+      {!loading && resources.length > 0 && (
+        <>
+          <div style={{ marginBottom: 12 }}>
+            <Text type="secondary">找到 {resources.length} 个学习资源</Text>
+          </div>
+          <Row gutter={[16, 16]}>
+            {resources.map((r, i) => {
+              const platform = r.platform || '其他'
+              return (
+                <Col xs={24} sm={12} lg={8} key={i}>
+                  <a href={r.url} target="_blank" rel="noopener noreferrer" style={{ textDecoration: 'none' }}>
+                    <Card
+                      hoverable
+                      className="resource-card"
+                      style={{ height: '100%', borderTop: `3px solid ${platformColors[platform] || '#4F46E5'}` }}
+                    >
+                      <Space direction="vertical" style={{ width: '100%' }}>
+                        <Space>
+                          <Tag color={platformColors[platform] || 'default'}>
+                            {platformIcons[platform] || <GlobalOutlined />} {platform}
+                          </Tag>
+                          <Tag>{typeIcons[r.type] || null} {r.type}</Tag>
+                        </Space>
+                        <Text strong style={{ fontSize: 15, color: '#333' }}>{r.title}</Text>
+                        <Paragraph type="secondary" style={{ margin: 0, fontSize: 13 }}>
+                          {r.description}
+                        </Paragraph>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 4, justifyContent: 'flex-end' }}>
+                          <LinkOutlined style={{ color: '#999', fontSize: 12 }} />
+                          <Text style={{ color: '#4F46E5', fontSize: 12 }}>点击前往</Text>
+                        </div>
+                      </Space>
+                    </Card>
+                  </a>
+                </Col>
+              )
+            })}
+          </Row>
+
+          <Card style={{ marginTop: 16, background: '#f0f5ff' }} size="small">
+            <Text type="secondary">
+              💡 点击任意卡片将在新标签页打开对应平台的学习资源。搜索结果由 AI 实时生成。
+            </Text>
+          </Card>
+        </>
+      )}
+    </div>
+  )
+}
+
+export default LearningPathPage

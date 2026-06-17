@@ -1,0 +1,324 @@
+"""
+自适应学习闭环 API — 核心竞争力功能
+流程：选主题→生成资料→答题→批改→分析→补强→再测→掌握
+"""
+import json
+import asyncio
+import uuid
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel
+from typing import Optional, List
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from app.models.database import get_db, LearningRecord
+from app.llm.spark_client import SparkClient
+
+router = APIRouter()
+spark = SparkClient()
+
+
+class StartLearningRequest(BaseModel):
+    topic: str
+    student_id: str = "default"
+
+
+class SubmitQuizRequest(BaseModel):
+    session_id: str
+    answers: dict  # {question_id: answer}
+    student_id: str = "default"
+
+
+# 存储学习会话
+learning_sessions = {}
+
+
+@router.post("/start")
+async def start_learning(req: StartLearningRequest, db: AsyncSession = Depends(get_db)):
+    """第1步：开始学习 — 生成学习资料"""
+    session_id = str(uuid.uuid4())[:8]
+    topic = req.topic
+
+    # 并行生成3种资料（加超时保护）
+    doc_prompt = f"""你是AI课程教师。请用500字讲解"{topic}"的核心概念。
+包含：定义、关键点（3-5个）、一个生活中的类比、一个实际应用。
+用Markdown格式，语言通俗易懂。直接输出内容。"""
+
+    mindmap_prompt = f"""为"{topic}"生成思维导图。用Mermaid mindmap语法，不超过3层。
+核心概念在中心，分支展示子知识点。只输出mermaid代码块。"""
+
+    code_prompt = f"""用Python写一个"{topic}"的简单代码示例。
+要求：30行以内，有注释，可直接运行。只输出代码块。"""
+
+    async def safe_chat(prompt, system, timeout=50):
+        try:
+            return await asyncio.wait_for(spark.chat(prompt, system_prompt=system), timeout=timeout)
+        except Exception as e:
+            print(f"[学习资料生成失败] {e}")
+            return f"（生成中遇到问题，请稍后重试）"
+
+    # 并行执行
+    doc_task = safe_chat(doc_prompt, "你是一位耐心的AI教师。")
+    mm_task = safe_chat(mindmap_prompt, "你是一位教学设计专家。")
+    code_task = safe_chat(code_prompt, "你是一位Python编程导师。")
+
+    results = await asyncio.gather(doc_task, mm_task, code_task, return_exceptions=True)
+
+    doc_content = results[0] if not isinstance(results[0], Exception) else f"（生成失败: {results[0]}）"
+    mm_content = results[1] if not isinstance(results[1], Exception) else f"（生成失败: {results[1]}）"
+    code_content = results[2] if not isinstance(results[2], Exception) else f"（生成失败: {results[2]}）"
+
+    # 存储会话
+    learning_sessions[session_id] = {
+        "topic": topic,
+        "student_id": req.student_id,
+        "stage": "learn",  # learn → quiz → review → complete
+        "materials": {
+            "document": doc_content,
+            "mindmap": mm_content,
+            "code": code_content,
+        },
+        "quiz": None,
+        "quiz_result": None,
+        "reinforcement": None,
+        "round": 1,  # 第几轮
+    }
+
+    return {
+        "success": True,
+        "session_id": session_id,
+        "topic": topic,
+        "materials": {
+            "document": doc_content,
+            "mindmap": mm_content,
+            "code": code_content,
+        },
+        "stage": "learn",
+    }
+
+
+@router.post("/quiz/generate")
+async def generate_quiz(session_id: str):
+    """第2步：生成测验题"""
+    session = learning_sessions.get(session_id)
+    if not session:
+        return {"success": False, "message": "学习会话不存在"}
+
+    topic = session["topic"]
+    round_num = session.get("round", 1)
+    weak_points = session.get("weak_points", [])
+
+    # 如果是补强轮，针对薄弱点出题
+    focus = ""
+    if round_num > 1 and weak_points:
+        focus = f"重点针对这些薄弱点：{', '.join(weak_points[:3])}"
+
+    prompt = f"""你是出题专家。请为"{topic}"生成5道练习题。
+
+{focus}
+难度：{'简单' if round_num > 1 else '中等'}
+题型：选择题3道 + 简答题2道
+
+返回JSON数组，每道题包含：
+{{"id": 1, "type": "choice", "question": "题目", "options": ["A.选项","B.选项","C.选项","D.选项"], "answer": "A", "explanation": "解析"}}
+
+选择题的options必须是4个选项的数组。只返回JSON。"""
+
+    try:
+        response = await asyncio.wait_for(spark.chat(prompt, system_prompt="你是出题专家，只返回JSON。"), timeout=60)
+        response = response.strip()
+        if "```" in response:
+            response = response.split("```")[1].replace("json", "", 1)
+        questions = json.loads(response)
+        # 验证题目格式
+        if not isinstance(questions, list) or len(questions) < 3:
+            raise ValueError("题目数量不足")
+        for q in questions:
+            if "id" not in q or "question" not in q:
+                raise ValueError("题目格式错误")
+    except Exception as e:
+        print(f"[出题失败] {e}")
+        questions = [
+            {"id": 1, "type": "choice", "question": f"关于{topic}，以下说法正确的是？",
+             "options": ["A.它是基础概念", "B.它不重要", "C.它已过时", "D.无法应用"],
+             "answer": "A", "explanation": f"{topic}是核心概念"},
+            {"id": 2, "type": "choice", "question": f"{topic}主要应用于？",
+             "options": ["A.人工智能", "B.烹饪", "C.园艺", "D.音乐"],
+             "answer": "A", "explanation": "应用于AI领域"},
+            {"id": 3, "type": "choice", "question": f"学习{topic}需要什么基础？",
+             "options": ["A.数学和编程", "B.体育", "C.历史", "D.地理"],
+             "answer": "A", "explanation": "需要数学和编程基础"},
+            {"id": 4, "type": "short_answer", "question": f"请用一句话描述{topic}的核心思想",
+             "answer": "", "explanation": "开放性问题"},
+            {"id": 5, "type": "short_answer", "question": f"{topic}的一个实际应用场景是什么？",
+             "answer": "", "explanation": "开放性问题"},
+        ]
+
+    session["quiz"] = questions
+    session["stage"] = "quiz"
+
+    return {"success": True, "questions": questions, "stage": "quiz", "round": session.get("round", 1)}
+
+
+@router.post("/quiz/submit")
+async def submit_quiz(req: SubmitQuizRequest):
+    """第3步：提交测验并批改"""
+    session = learning_sessions.get(req.session_id)
+    if not session:
+        return {"success": False, "message": "学习会话不存在"}
+
+    questions = session.get("quiz", [])
+    answers = req.answers
+    results = []
+    correct_count = 0
+    wrong_topics = []
+
+    for q in questions:
+        qid = str(q["id"])
+        user_answer = answers.get(qid, "").strip()
+        correct_answer = str(q.get("answer", "")).strip()
+        q_type = q.get("type", "choice")
+
+        is_correct = False
+        if q_type == "choice":
+            is_correct = user_answer.upper() == correct_answer.upper() or user_answer == correct_answer
+        elif q_type == "fill":
+            is_correct = user_answer.lower() in correct_answer.lower() if correct_answer else False
+        elif q_type == "short_answer":
+            # 简答：AI 批改
+            if user_answer and len(user_answer) > 5:
+                try:
+                    grade_prompt = f"""判断学生回答是否正确。
+题目：{q['question']}
+参考答案：{q.get('answer', '开放性问题')}
+学生回答：{user_answer}
+
+只回答一个字：对 或 错"""
+                    grade = await asyncio.wait_for(spark.chat(grade_prompt, system_prompt="你是批改老师。"), timeout=15)
+                    is_correct = "对" in grade[:5]
+                except Exception:
+                    is_correct = len(user_answer) > 10  # 简单判断
+            else:
+                is_correct = False
+
+        if is_correct:
+            correct_count += 1
+        else:
+            wrong_topics.append(q["question"][:40])
+
+        results.append({
+            "question_id": q["id"],
+            "question": q["question"],
+            "type": q_type,
+            "user_answer": user_answer,
+            "correct_answer": correct_answer,
+            "is_correct": is_correct,
+            "explanation": q.get("explanation", ""),
+        })
+
+    total = len(questions)
+    score = int(correct_count / max(total, 1) * 100)
+
+    session["quiz_result"] = {
+        "score": score,
+        "correct_count": correct_count,
+        "total": total,
+        "results": results,
+        "wrong_topics": wrong_topics,
+    }
+
+    # 判断是否需要补强
+    if score < 80:
+        session["stage"] = "reinforce"
+        session["weak_points"] = wrong_topics
+    else:
+        session["stage"] = "complete"
+
+    # 保存学习记录
+    try:
+        from app.models.database import async_session as db_session
+        async with db_session() as db:
+            db.add(LearningRecord(
+                student_id=req.student_id,
+                action_type="quiz",
+                topic=session["topic"],
+                score=score,
+                extra_data={"correct": correct_count, "total": total, "round": session.get("round", 1)}
+            ))
+            await db.commit()
+    except Exception as e:
+        print(f"[保存记录失败] {e}")
+
+    return {
+        "success": True,
+        "score": score,
+        "correct_count": correct_count,
+        "total": total,
+        "results": results,
+        "wrong_topics": wrong_topics,
+        "stage": session["stage"],
+        "message": f"掌握程度：{score}%" + ("，部分知识点需要加强" if score < 80 else "，恭喜掌握！"),
+    }
+
+
+@router.post("/reinforce")
+async def generate_reinforcement(session_id: str):
+    """第4步：生成补强资料"""
+    session = learning_sessions.get(session_id)
+    if not session:
+        return {"success": False, "message": "学习会话不存在"}
+
+    topic = session["topic"]
+    weak_points = session.get("weak_points", [])
+
+    # 生成针对性补强资料
+    prompt = f"""你是AI辅导老师。学生在"{topic}"的测试中，以下知识点没掌握：
+{json.dumps(weak_points, ensure_ascii=False)}
+
+请针对这些薄弱点，生成一份简明的补强讲解：
+1. 逐个解释错误原因
+2. 用简单例子说明正确理解
+3. 给出记忆技巧
+4. 200-300字
+
+用Markdown格式，语气亲切。"""
+
+    try:
+        reinforcement = await asyncio.wait_for(spark.chat(prompt, system_prompt="你是耐心的AI辅导老师。"), timeout=60)
+        if len(reinforcement) < 50:
+            raise ValueError("补强内容太短")
+    except Exception as e:
+        print(f"[补强生成失败] {e}")
+        reinforcement = f"## {topic} 薄弱点补强\n\n"
+        for t in weak_points:
+            reinforcement += f"### {t}\n\n请重点复习这个知识点。建议：\n1. 重新阅读相关资料\n2. 尝试用自己的话解释\n3. 做相关练习题\n\n"
+        reinforcement += f"\n**建议：** 重点理解以上知识点后，再做一次测试。"
+
+    session["reinforcement"] = reinforcement
+    session["round"] = session.get("round", 1) + 1
+    session["stage"] = "review"
+
+    return {
+        "success": True,
+        "reinforcement": reinforcement,
+        "wrong_topics": weak_points,
+        "stage": "review",
+        "round": session.get("round", 1),
+    }
+
+
+@router.get("/status/{session_id}")
+async def get_status(session_id: str):
+    """获取学习会话状态"""
+    session = learning_sessions.get(session_id)
+    if not session:
+        return {"success": False, "message": "会话不存在"}
+
+    return {
+        "success": True,
+        "topic": session["topic"],
+        "stage": session["stage"],
+        "round": session.get("round", 1),
+        "has_materials": bool(session.get("materials")),
+        "has_quiz": bool(session.get("quiz")),
+        "quiz_result": session.get("quiz_result"),
+    }

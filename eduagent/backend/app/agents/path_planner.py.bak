@@ -1,0 +1,76 @@
+"""
+路径规划智能体 — 个性化学习路径规划
+"""
+import json
+import uuid
+from typing import AsyncGenerator
+from app.agents.base import BaseAgent, AgentRole, AgentMessage, AgentResponse
+from app.llm.spark_client import SparkClient
+from app.llm.prompts import PromptTemplates
+
+
+class PathPlannerAgent(BaseAgent):
+    """路径规划智能体 — 基于知识图谱和画像规划学习路径"""
+
+    def __init__(self):
+        super().__init__(
+            agent_id="path_planner",
+            role=AgentRole.PATH_PLANNER,
+            name="路径规划智能体"
+        )
+        self.spark = SparkClient()
+
+    async def process(self, message: AgentMessage) -> AgentResponse:
+        task = message.content.get("task", "")
+        profile = message.context.get("profile", {})
+        current_progress = message.context.get("learning_progress", {})
+
+        # 获取课程知识图谱
+        knowledge_graph = await self._get_knowledge_graph()
+
+        prompt = PromptTemplates.PATH_PLANNING.format(
+            knowledge_graph=json.dumps(knowledge_graph, ensure_ascii=False),
+            student_profile=json.dumps(profile, ensure_ascii=False),
+            current_progress=json.dumps(current_progress, ensure_ascii=False)
+        )
+
+        result = await self.spark.chat(prompt, PromptTemplates.SYSTEM_BASE)
+        parsed = self._parse_path(result)
+
+        return self._create_response(True, {"path": parsed})
+
+    async def process_stream(self, message: AgentMessage) -> AsyncGenerator[str, None]:
+        result = await self.process(message)
+        yield json.dumps(result.content, ensure_ascii=False)
+
+    async def _get_knowledge_graph(self) -> dict:
+        """获取课程知识图谱"""
+        # 人工智能导论知识图谱（简化版）
+        return {
+            "course": "人工智能导论",
+            "topics": [
+                {"id": "ai_overview", "name": "人工智能概述", "level": 1, "prerequisites": []},
+                {"id": "search", "name": "搜索算法", "level": 2, "prerequisites": ["ai_overview"]},
+                {"id": "knowledge_rep", "name": "知识表示", "level": 2, "prerequisites": ["ai_overview"]},
+                {"id": "ml_basics", "name": "机器学习基础", "level": 2, "prerequisites": ["ai_overview"]},
+                {"id": "supervised", "name": "监督学习", "level": 3, "prerequisites": ["ml_basics"]},
+                {"id": "unsupervised", "name": "无监督学习", "level": 3, "prerequisites": ["ml_basics"]},
+                {"id": "neural_network", "name": "神经网络", "level": 3, "prerequisites": ["supervised"]},
+                {"id": "deep_learning", "name": "深度学习", "level": 4, "prerequisites": ["neural_network"]},
+                {"id": "cnn", "name": "卷积神经网络", "level": 4, "prerequisites": ["deep_learning"]},
+                {"id": "rnn", "name": "循环神经网络", "level": 4, "prerequisites": ["deep_learning"]},
+                {"id": "nlp", "name": "自然语言处理", "level": 5, "prerequisites": ["rnn"]},
+                {"id": "cv", "name": "计算机视觉", "level": 5, "prerequisites": ["cnn"]},
+                {"id": "rl", "name": "强化学习", "level": 5, "prerequisites": ["neural_network"]},
+            ]
+        }
+
+    def _parse_path(self, response: str) -> dict:
+        try:
+            response = response.strip()
+            if response.startswith("```"):
+                lines = response.split("\n")
+                response = "\n".join(lines[1:-1])
+            return json.loads(response)
+        except json.JSONDecodeError:
+            return {"error": "路径解析失败", "raw": response}
